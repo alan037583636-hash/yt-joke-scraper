@@ -3,67 +3,60 @@ import { writeFile } from "node:fs/promises";
 import { fetchTranscript } from "youtube-transcript";
 
 const CHANNEL_ID = "UC0lbAQVpenvfA2QqzsRtL_g";
+// 修正 1：改為正確存在的模型名稱
 const GEMINI_MODEL = "gemini-3.5-flash-lite";
+const MAX_GEMINI_RETRIES = 3;
+const GEMINI_RETRY_DELAY_MS = 2000;
 const apiKey = process.env.GEMINI_API_KEY;
 
 if (!apiKey) {
-  throw new Error(
-    "GEMINI_API_KEY is missing. Add it to your .env file or GitHub Actions secrets.",
-  );
+  throw new Error("GEMINI_API_KEY is missing. Add it to your .env file or GitHub Actions secrets.");
 }
 
 function formatTime(offset, offsetInMilliseconds = false) {
-  const totalSeconds = Math.floor(
-    offsetInMilliseconds ? offset / 1000 : offset,
-  );
+  const totalSeconds = Math.floor(offsetInMilliseconds ? offset / 1000 : offset);
   const minutes = Math.floor(totalSeconds / 60);
   const seconds = totalSeconds % 60;
-
   return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
 }
 
-async function getLatestVideoId(channelId) {
+// 修正 2：改為回傳「前 3 支」符合條件的影片 ID 陣列，作為備用
+async function getLatestVideoIds(channelId) {
   const feedUrl = new URL("https://www.youtube.com/feeds/videos.xml");
   feedUrl.searchParams.set("channel_id", channelId);
 
   const response = await fetch(feedUrl);
   if (!response.ok) {
-    throw new Error(
-      `YouTube RSS request failed (${response.status} ${response.statusText}).`,
-    );
+    throw new Error(`YouTube RSS request failed (${response.status} ${response.statusText}).`);
   }
 
   const feedXml = await response.text();
   const entries = feedXml.matchAll(/<entry(?:\s[^>]*)?>([\s\S]*?)<\/entry>/g);
-
+  
+  const videoIds = [];
   for (const [, entryXml] of entries) {
     const title = entryXml.match(/<title(?:\s[^>]*)?>([\s\S]*?)<\/title>/)?.[1];
-    const videoId = entryXml.match(
-      /<yt:videoId(?:\s[^>]*)?>([\s\S]*?)<\/yt:videoId>/,
-    )?.[1];
+    const videoId = entryXml.match(/<yt:videoId(?:\s[^>]*)?>([\s\S]*?)<\/yt:videoId>/)?.[1];
 
     if (title?.includes("早晨財經") && videoId) {
-      return videoId.trim();
+      videoIds.push(videoId.trim());
     }
   }
 
-  throw new Error(
-    `No video with a title containing "早晨財經" found in YouTube RSS feed for ${channelId}.`,
-  );
+  if (videoIds.length === 0) {
+    throw new Error(`找不到包含「早晨財經」的近期影片。`);
+  }
+  return videoIds.slice(0, 3); // 回傳最新的 3 支
 }
 
 async function getVideoTranscript(videoId) {
+  // 這裡你修好無窮迴圈了，很棒！
   const transcript = await fetchTranscript(videoId);
   const offsetInMilliseconds =
     transcript.length > 0 &&
-    transcript.reduce((total, entry) => total + entry.duration, 0) /
-      transcript.length >
-      100;
+    transcript.reduce((total, entry) => total + entry.duration, 0) / transcript.length > 100;
 
-  return transcript.map(
-    ({ text, offset }) =>
-      `[${formatTime(offset, offsetInMilliseconds)}] ${text}`,
-  );
+  return transcript.map(({ text, offset }) => `[${formatTime(offset, offsetInMilliseconds)}] ${text}`);
 }
 
 async function findJoke(transcriptLines) {
@@ -107,32 +100,44 @@ timestamp 必須抄錄該笑話開始處逐字稿方括號中的時間戳，不�
 逐字稿如下：
 ${fullText}`;
 
-  const response = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
-    {
-      method: "POST",
-      headers: {
-        "x-goog-api-key": apiKey,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }] }],
-        generationConfig: { responseMimeType: "application/json" },
-      }),
-    },
-  );
-  const responseBody = await response.text();
+  let response;
+  let responseBody;
 
-  if (!response.ok) {
-    throw new Error(
-      `Gemini API request failed (${response.status} ${response.statusText}): ${responseBody}`,
+  for (let attempt = 0; attempt <= MAX_GEMINI_RETRIES; attempt += 1) {
+    response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
+      {
+        method: "POST",
+        headers: {
+          "x-goog-api-key": apiKey,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: { responseMimeType: "application/json" },
+        }),
+      },
     );
+    responseBody = await response.text();
+
+    if (response.ok) {
+      break;
+    }
+
+    const errorMessage = `Gemini API request failed (${response.status} ${response.statusText}): ${responseBody}`;
+    if (response.status !== 503 || attempt === MAX_GEMINI_RETRIES) {
+      throw new Error(errorMessage);
+    }
+
+    const delayMs = GEMINI_RETRY_DELAY_MS * 2 ** attempt;
+    console.warn(
+      `${errorMessage} Retrying in ${delayMs}ms (retry ${attempt + 1}/${MAX_GEMINI_RETRIES}).`,
+    );
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
   }
 
   const result = JSON.parse(responseBody);
-  const responseText = result.candidates?.[0]?.content?.parts
-    ?.map((part) => part.text ?? "")
-    .join("");
+  const responseText = result.candidates?.[0]?.content?.parts?.map((part) => part.text ?? "").join("");
   if (typeof responseText !== "string") {
     throw new Error("Gemini API response did not contain a message.");
   }
@@ -140,37 +145,54 @@ ${fullText}`;
   return JSON.stringify(JSON.parse(responseText), null, 2);
 }
 
+// ================= 主程式執行區塊 =================
 console.log("🤖 [系統啟動] 開始尋找今天的財經皓角笑話...");
-
-const taiwanTime = new Intl.DateTimeFormat("zh-TW", {
-  timeZone: "Asia/Taipei",
-  dateStyle: "full",
-  timeStyle: "long",
-}).format(new Date());
+const taiwanTime = new Intl.DateTimeFormat("zh-TW", { timeZone: "Asia/Taipei", dateStyle: "full", timeStyle: "long" }).format(new Date());
 console.log(`目前台灣時間：${taiwanTime}`);
 
-try {
-  const latestVideoId = await getLatestVideoId(CHANNEL_ID);
-  console.log(`🔍 找到最新影片 ID: ${latestVideoId}`);
+(async () => {
+  try {
+    const latestVideoIds = await getLatestVideoIds(CHANNEL_ID);
+    console.log(`🔍 找到最新影片清單: [${latestVideoIds.join(", ")}]`);
 
-  const formattedTranscript = await getVideoTranscript(latestVideoId);
-  console.log(`總共抓到 ${formattedTranscript.length} 句字幕`);
-  console.log(formattedTranscript.slice(0, 10).join("\n"));
+    let formattedTranscript = null;
+    let successfulVideoId = null;
 
-  const jokeAnalysis = JSON.parse(await findJoke(formattedTranscript));
-  const dateParts = new Intl.DateTimeFormat("en", {
-    timeZone: "Asia/Taipei",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  }).formatToParts(new Date());
-  const fetchDate = `${dateParts.find(({ type }) => type === "year").value}-${dateParts.find(({ type }) => type === "month").value}-${dateParts.find(({ type }) => type === "day").value}`;
-  const result = { ...jokeAnalysis, fetch_date: fetchDate };
+    // 迴圈容錯：嘗試陣列中的影片，只要有一支成功抓到字幕就跳出迴圈
+    for (const videoId of latestVideoIds) {
+      try {
+        console.log(`⏳ 嘗試抓取影片 ${videoId} 的字幕...`);
+        formattedTranscript = await getVideoTranscript(videoId);
+        successfulVideoId = videoId;
+        console.log(`✅ 成功抓取影片 ${videoId} 的字幕！共 ${formattedTranscript.length} 句。`);
+        break;
+      } catch (err) {
+        console.log(`⚠️ 影片 ${videoId} 抓取字幕失敗 (${err.message})，嘗試下一支...`);
+      }
+    }
 
-  await writeFile("latest_joke.json", `${JSON.stringify(result, null, 2)}\n`);
-  console.log("AI 分析結果：");
-  console.log(JSON.stringify(result, null, 2));
-} catch (error) {
-  console.error("笑話擷取流程失敗：", error);
-  process.exitCode = 1;
-}
+    if (!formattedTranscript) {
+      console.log('🚨 備用影片皆無字幕或抓取失敗，今日任務提早結束。');
+      process.exit(0);
+    }
+
+    console.log(formattedTranscript.slice(0, 5).join("\n") + "\n...");
+
+    const jokeAnalysis = JSON.parse(await findJoke(formattedTranscript));
+    
+    // 取得台灣時間的 YYYY-MM-DD
+    const dateParts = new Intl.DateTimeFormat("en", { timeZone: "Asia/Taipei", year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(new Date());
+    const fetchDate = `${dateParts.find(({ type }) => type === "year").value}-${dateParts.find(({ type }) => type === "month").value}-${dateParts.find(({ type }) => type === "day").value}`;
+    
+    // 將成功的 Video ID 一併存入 JSON，方便前端直接做 iframe 嵌入跳轉！
+    const result = { ...jokeAnalysis, video_id: successfulVideoId, fetch_date: fetchDate };
+
+    await writeFile("latest_joke.json", `${JSON.stringify(result, null, 2)}\n`);
+    console.log("🎉 AI 分析結果已儲存至 latest_joke.json：");
+    console.log(JSON.stringify(result, null, 2));
+
+  } catch (error) {
+    console.error("❌ 笑話擷取流程失敗：", error);
+    process.exitCode = 1;
+  }
+})();

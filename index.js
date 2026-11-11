@@ -34,12 +34,22 @@ async function getLatestVideoId(channelId) {
   }
 
   const feedXml = await response.text();
-  const match = feedXml.match(/<yt:videoId>\s*([^<]+)\s*<\/yt:videoId>/);
-  if (!match) {
-    throw new Error(`No video ID found in YouTube RSS feed for ${channelId}.`);
+  const entries = feedXml.matchAll(/<entry(?:\s[^>]*)?>([\s\S]*?)<\/entry>/g);
+
+  for (const [, entryXml] of entries) {
+    const title = entryXml.match(/<title(?:\s[^>]*)?>([\s\S]*?)<\/title>/)?.[1];
+    const videoId = entryXml.match(
+      /<yt:videoId(?:\s[^>]*)?>([\s\S]*?)<\/yt:videoId>/,
+    )?.[1];
+
+    if (title?.includes("早晨財經") && videoId) {
+      return videoId.trim();
+    }
   }
 
-  return match[1];
+  throw new Error(
+    `No video with a title containing "早晨財經" found in YouTube RSS feed for ${channelId}.`,
+  );
 }
 
 async function getVideoTranscript(videoId) {

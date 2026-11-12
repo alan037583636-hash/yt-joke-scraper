@@ -8,9 +8,14 @@ const GEMINI_MODEL = "gemini-3.5-flash-lite";
 const MAX_GEMINI_RETRIES = 3;
 const GEMINI_RETRY_DELAY_MS = 2000;
 const apiKey = process.env.GEMINI_API_KEY;
+const youtubeApiKey = process.env.YOUTUBE_API_KEY;
 
 if (!apiKey) {
   throw new Error("GEMINI_API_KEY is missing. Add it to your .env file or GitHub Actions secrets.");
+}
+
+if (!youtubeApiKey) {
+  throw new Error("YOUTUBE_API_KEY is missing. Add it to your .env file or GitHub Actions secrets.");
 }
 
 function formatTime(offset, offsetInMilliseconds = false) {
@@ -20,33 +25,69 @@ function formatTime(offset, offsetInMilliseconds = false) {
   return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
 }
 
-// 修正 2：改為回傳「前 3 支」符合條件的影片 ID 陣列，作為備用
-async function getLatestVideoIds(channelId) {
-  const feedUrl = new URL("https://www.youtube.com/feeds/videos.xml");
-  feedUrl.searchParams.set("channel_id", channelId);
+async function fetchYouTubeApi(endpoint, params) {
+  const url = new URL(`https://www.googleapis.com/youtube/v3/${endpoint}`);
+  for (const [name, value] of Object.entries(params)) {
+    url.searchParams.set(name, value);
+  }
+  url.searchParams.set("key", youtubeApiKey);
 
-  const response = await fetch(feedUrl);
+  const response = await fetch(url);
+  const responseBody = await response.text();
   if (!response.ok) {
-    throw new Error(`YouTube RSS request failed (${response.status} ${response.statusText}).`);
+    throw new Error(
+      `YouTube Data API ${endpoint} request failed (${response.status} ${response.statusText}): ${responseBody}`,
+    );
   }
 
-  const feedXml = await response.text();
-  const entries = feedXml.matchAll(/<entry(?:\s[^>]*)?>([\s\S]*?)<\/entry>/g);
-  
-  const videoIds = [];
-  for (const [, entryXml] of entries) {
-    const title = entryXml.match(/<title(?:\s[^>]*)?>([\s\S]*?)<\/title>/)?.[1];
-    const videoId = entryXml.match(/<yt:videoId(?:\s[^>]*)?>([\s\S]*?)<\/yt:videoId>/)?.[1];
+  return JSON.parse(responseBody);
+}
 
-    if (title?.includes("早晨財經") && videoId) {
-      videoIds.push(videoId.trim());
+async function getLatestVideoIds(channelId) {
+  const channelData = await fetchYouTubeApi("channels", {
+    part: "contentDetails",
+    id: channelId,
+  });
+  const uploadsPlaylistId =
+    channelData.items?.[0]?.contentDetails?.relatedPlaylists?.uploads;
+  if (!uploadsPlaylistId) {
+    throw new Error(`YouTube Data API returned no uploads playlist for channel ${channelId}.`);
+  }
+
+  const videoIds = [];
+  let pageToken;
+  while (videoIds.length < 3) {
+    const params = {
+      part: "snippet",
+      playlistId: uploadsPlaylistId,
+      maxResults: "50",
+    };
+    if (pageToken) {
+      params.pageToken = pageToken;
+    }
+
+    const playlistData = await fetchYouTubeApi("playlistItems", params);
+    for (const item of playlistData.items ?? []) {
+      const title = item.snippet?.title;
+      const videoId = item.snippet?.resourceId?.videoId;
+      if (title?.includes("早晨財經") && videoId) {
+        videoIds.push(videoId);
+        if (videoIds.length === 3) {
+          break;
+        }
+      }
+    }
+
+    pageToken = playlistData.nextPageToken;
+    if (!pageToken) {
+      break;
     }
   }
 
   if (videoIds.length === 0) {
-    throw new Error(`找不到包含「早晨財經」的近期影片。`);
+    throw new Error("找不到包含「早晨財經」的近期影片。");
   }
-  return videoIds.slice(0, 3); // 回傳最新的 3 支
+  return videoIds;
 }
 
 async function getVideoTranscript(videoId) {
